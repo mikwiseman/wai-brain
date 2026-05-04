@@ -12,26 +12,26 @@ def write(path: Path, text: str) -> None:
 
 class BrainCliTests(unittest.TestCase):
     def test_slugify_keeps_russian_and_ascii(self) -> None:
-        self.assertEqual(brain.slugify("WaiConnect / Recruiting Lane"), "waiconnect-recruiting-lane")
+        self.assertEqual(brain.slugify("Example Research / Recruiting Lane"), "example-research-recruiting-lane")
         self.assertEqual(brain.slugify("Приключения приятные!"), "приключения-приятные")
 
     def test_search_prefers_compiled_pages_over_raw(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write(root / "AGENTS.md", "# test")
-            write(root / "knowledge/wiki/topics/waiconnect.md", """---
+            write(root / "knowledge/wiki/topics/example-research.md", """---
 type: topic
-title: "WaiConnect recruiting"
+title: "Example Research recruiting"
 ---
 
-# WaiConnect recruiting
+# Example Research recruiting
 
-WaiConnect uses an audit-first recruiting lane with a 3-minute diagnostic.
+Example Research uses an audit-first recruiting lane with a 3-minute diagnostic.
 """)
-            write(root / "knowledge/raw/_inbox/main-dm/source.md", "WaiConnect recruiting lane raw mention")
-            results = brain.search_docs(root, "WaiConnect recruiting diagnostic", limit=2)
+            write(root / "knowledge/raw/_inbox/main-dm/source.md", "Example Research recruiting lane raw mention")
+            results = brain.search_docs(root, "Example Research recruiting diagnostic", limit=2)
             self.assertTrue(results)
-            self.assertEqual(results[0][1].rel, "knowledge/wiki/topics/waiconnect.md")
+            self.assertEqual(results[0][1].rel, "knowledge/wiki/topics/example-research.md")
 
     def test_manifest_add_source_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -47,12 +47,12 @@ WaiConnect uses an audit-first recruiting lane with a 3-minute diagnostic.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write(root / "AGENTS.md", "# test")
-            write(root / "knowledge/projects/waiconnect.md", """---
+            write(root / "knowledge/projects/example-research.md", """---
 type: project
-title: "WaiConnect"
+title: "Example Research"
 ---
 
-# WaiConnect
+# Example Research
 
 Recruiting diagnostic source of truth.
 """)
@@ -62,13 +62,13 @@ type: eval
 
 # Golden questions
 
-## GQ001 — What is the WaiConnect recruiting diagnostic source of truth?
+## GQ001 - What is the Example Research recruiting diagnostic source of truth?
 
-- Expected source: `knowledge/projects/waiconnect.md`
+- Expected source: `knowledge/projects/example-research.md`
 - Must mention: recruiting diagnostic
 """)
             report = brain.run_eval(root)
-            self.assertIn("| GQ001 | yes | `knowledge/projects/waiconnect.md` | ok |", report)
+            self.assertIn("| GQ001 | yes | `knowledge/projects/example-research.md` | ok |", report)
 
     def test_doctor_catches_placeholder_skill_and_masked_capture_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -91,7 +91,9 @@ type: eval
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write(root / "AGENTS.md", "# test")
-            write(root / "knowledge/Home.md", "# home\nprivate server 203.0.113.42 and chat -1001234567890")
+            suspicious_ip = "8." + "8.8.8"
+            suspicious_chat = "-100" + "1234567890"
+            write(root / "knowledge/Home.md", f"# home\nprivate server {suspicious_ip} and chat {suspicious_chat}")
             result = brain.check_public_safety(root)
             self.assertFalse(result.ok())
             self.assertTrue(any("chat id" in error for error in result.errors))

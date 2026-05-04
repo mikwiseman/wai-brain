@@ -32,10 +32,16 @@ SECRET_PATTERNS = [
     re.compile(r"ghp_[A-Za-z0-9_]{20,}"),
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{20,}"),
 ]
+PRIVATE_ROOT_PATTERN = "|".join(["root" + "@", "/" + "root/", "~/" + r"\.openclaw"])
 PUBLIC_SAFETY_PATTERNS = [
     ("real Telegram-style chat id", re.compile(r"(?<![A-Za-z0-9])-100\d{7,}|(?<![A-Za-z0-9])-\d{9,}")),
-    ("public IPv4 address", re.compile(r"\b(?!0\.0\.0\.0|127\.0\.0\.1|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[0-1])\.)(?:\d{1,3}\.){3}\d{1,3}\b")),
-    ("private root path", re.compile(r"root@|/root/|~/\.openclaw")),
+    (
+        "public IPv4 address",
+        re.compile(
+            r"\b(?!0\.0\.0\.0|127\.0\.0\.1|10\.|192\.168\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|172\.(?:1[6-9]|2\d|3[0-1])\.)(?:\d{1,3}\.){3}\d{1,3}\b"
+        ),
+    ),
+    ("private root path", re.compile(PRIVATE_ROOT_PATTERN)),
     ("OAuth email", re.compile(r"openai-codex:[^\s`]+@|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
 ]
 
@@ -323,9 +329,17 @@ def check_golden_questions(root: Path) -> CheckResult:
     result = CheckResult([], [])
     path = root / "knowledge" / "eval" / "golden-questions.md"
     text = read_text(path)
-    count = len(re.findall(r"^## GQ\d{3}\s+—", text, re.MULTILINE))
+    count = len(re.findall(r"^## GQ\d{3}\s+[—-]", text, re.MULTILINE))
     if count < 20:
         result.add_error(f"Golden question set has {count} questions; expected at least 20")
+    for question in parse_golden_questions(text):
+        if not question["expected_sources"]:
+            result.add_error(f"Golden question lacks expected source: {question['id']}")
+        if not question["must_mention"]:
+            result.add_error(f"Golden question lacks must-mention terms: {question['id']}")
+        for source in question["expected_sources"]:
+            if not (root / str(source)).exists():
+                result.add_error(f"Golden question expected source is missing: {question['id']} -> {source}")
     return result
 
 
@@ -377,10 +391,12 @@ def check_manifests(root: Path) -> CheckResult:
 
 def check_secrets(root: Path) -> CheckResult:
     result = CheckResult([], [])
-    for doc in iter_markdown(root, include_raw=True):
+    for path in iter_public_text_files(root):
+        rel = path.relative_to(root).as_posix()
+        text = read_text(path)
         for pattern in SECRET_PATTERNS:
-            if pattern.search(doc.text):
-                result.add_error(f"Possible secret pattern in {doc.rel}")
+            if pattern.search(text):
+                result.add_error(f"Possible secret pattern in {rel}")
     return result
 
 
@@ -390,7 +406,7 @@ def iter_public_text_files(root: Path) -> Iterable[Path]:
         if not path.is_file() or path.suffix not in suffixes:
             continue
         rel = path.relative_to(root).as_posix()
-        if rel.startswith((".git/", "scripts/", "tests/")):
+        if rel.startswith(".git/"):
             continue
         yield path
 
@@ -399,10 +415,10 @@ def check_public_safety(root: Path) -> CheckResult:
     result = CheckResult([], [])
     for path in iter_public_text_files(root):
         rel = path.relative_to(root).as_posix()
-        text = read_text(path)
-        for label, pattern in PUBLIC_SAFETY_PATTERNS:
-            if pattern.search(text):
-                result.add_error(f"Public-safety pattern ({label}) in {rel}")
+        for lineno, line in enumerate(read_text(path).splitlines(), start=1):
+            for label, pattern in PUBLIC_SAFETY_PATTERNS:
+                if pattern.search(line):
+                    result.add_error(f"Public-safety pattern ({label}) in {rel}:{lineno}")
     return result
 
 
@@ -486,7 +502,7 @@ def parse_golden_questions(text: str) -> list[dict[str, object]]:
         if not section.startswith("GQ"):
             continue
         header, *rest = section.splitlines()
-        match = re.match(r"(GQ\d{3})\s+—\s+(.+)", header)
+        match = re.match(r"(GQ\d{3})\s+[—-]\s+(.+)", header)
         if not match:
             continue
         body = "\n".join(rest)

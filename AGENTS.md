@@ -87,7 +87,7 @@ Concepts and topics in `wiki/` do NOT use this pattern — plain markdown.
 Format:
 ```markdown
 ## YYYY-MM-DD — short title
-**Made by:** mik | claude (draft)
+**Made by:** human | agent (draft)
 **Scope:** product | tooling | positioning | operations | personal | finance | health | family
 **Decision:** one paragraph.
 **Why:** rationale, links to raw/ sources.
