@@ -1,0 +1,12 @@
+.DS_Store
+node_modules/
+__pycache__/
+*.pyc
+.obsidian/workspace*.json
+.obsidian/cache/
+.obsidian/plugins/*/main.js
+.obsidian/plugins/*/manifest.json
+.obsidian/plugins/*/styles.css
+.smart-env/
+.playwright-mcp/
+.brain-cache/
