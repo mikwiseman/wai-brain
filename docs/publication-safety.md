@@ -16,6 +16,7 @@ python3 -m unittest discover -s tests
 python3 scripts/brain.py doctor
 python3 scripts/brain.py wiki build
 python3 scripts/brain.py site build
+python3 scripts/brain.py obsidian export --path /tmp/wai-brain-obsidian-check
 git diff --check
 ```
 

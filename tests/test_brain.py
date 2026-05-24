@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import unittest
 import urllib.request
@@ -329,6 +330,165 @@ class WaiBrainReviewPipelineTests(unittest.TestCase):
                 self.assertEqual(len(brain.read_jsonl(root / "knowledge/canonical/facts.jsonl")), 1)
             finally:
                 server.close()
+
+    def test_proposal_can_pin_claim_level_evidence_quote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "knowledge/raw/telegram/yulia.md"
+            quote = "Yulia needs a governed memory wiki"
+            write(root / "AGENTS.md", "# test")
+            write(source, f"Noise before. {quote}. Noise after.")
+            brain.ensure_layout(root)
+
+            proposal = brain.create_memory_proposal(
+                root,
+                title="Yulia governed memory wiki",
+                source_paths=[source],
+                evidence_quotes=[quote],
+                entity={"type": "person", "name": "Yulia Mitrovich"},
+                facts=[{"predicate": "needs", "value": "a governed memory wiki", "confidence": 0.9}],
+            )
+
+            evidence = proposal["payload"]["evidence"][0]
+            self.assertGreater(evidence["span"]["start"], 0)
+            self.assertEqual(evidence["span"]["end"] - evidence["span"]["start"], len(quote))
+            self.assertEqual(evidence["quote_hash"], hashlib.sha256(quote.encode("utf-8")).hexdigest())
+            self.assertEqual(evidence["excerpt"], quote)
+
+    def test_relation_proposal_builds_entity_graph_wiki_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mik_source = root / "knowledge/raw/notes/mik.md"
+            yulia_source = root / "knowledge/raw/telegram/yulia.md"
+            write(root / "AGENTS.md", "# test")
+            write(mik_source, "Mik is building WaiBrain.")
+            write(yulia_source, "Yulia discusses memory with Mik.")
+            brain.ensure_layout(root)
+            mik = brain.create_memory_proposal(
+                root,
+                title="Mik entity",
+                source_paths=[mik_source],
+                entity={"type": "person", "name": "Mik Wiseman"},
+            )
+            brain.accept_proposal(root, mik["id"])
+
+            yulia = brain.create_memory_proposal(
+                root,
+                title="Yulia discusses with Mik",
+                source_paths=[yulia_source],
+                entity={"type": "person", "name": "Yulia Mitrovich"},
+                relations=[
+                    {
+                        "predicate": "discusses_with",
+                        "object_id": "person/mik-wiseman",
+                        "confidence": 0.82,
+                    }
+                ],
+            )
+
+            self.assertEqual(yulia["kind"], "relation_add")
+            brain.accept_proposal(root, yulia["id"])
+            self.assertTrue(brain.run_doctor(root).ok())
+            brain.build_wiki(root)
+            page = root / "knowledge/wiki/entities/person/yulia-mitrovich.md"
+            text = page.read_text(encoding="utf-8")
+            self.assertIn("## Relations", text)
+            self.assertIn("[[Mik Wiseman|Mik Wiseman]]", text)
+            relations = brain.read_jsonl(root / "knowledge/canonical/relations.jsonl")
+            self.assertEqual(relations[0]["object_id"], "person/mik-wiseman")
+
+    def test_entity_merge_repoints_loser_facts_events_and_relations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            yulia_source = root / "knowledge/raw/telegram/yulia.md"
+            handle_source = root / "knowledge/raw/telegram/handle.md"
+            write(root / "AGENTS.md", "# test")
+            write(yulia_source, "Yulia wants governed memory.")
+            write(handle_source, "@yuliamitrovich83 wants governed memory and discussed it with Yulia.")
+            brain.ensure_layout(root)
+            winner = brain.create_memory_proposal(
+                root,
+                title="Yulia entity",
+                source_paths=[yulia_source],
+                entity={"type": "person", "name": "Yulia Mitrovich"},
+            )
+            loser = brain.create_memory_proposal(
+                root,
+                title="Yulia handle entity",
+                source_paths=[handle_source],
+                entity={"type": "person", "name": "@yuliamitrovich83", "aliases": ["@yuliamitrovich83"]},
+                facts=[{"predicate": "wants", "value": "governed memory", "confidence": 0.8}],
+                events=[{"date": "2026-05-24", "summary": "Discussed governed memory."}],
+                relations=[{"predicate": "same_context_as", "object_id": "person/yulia-mitrovich"}],
+            )
+            brain.accept_proposal(root, winner["id"])
+            brain.accept_proposal(root, loser["id"])
+
+            merge = brain.create_entity_merge_proposal(
+                root,
+                winner_id="person/yulia-mitrovich",
+                loser_id="person/yuliamitrovich83",
+                reason="Telegram handle belongs to the same person.",
+            )
+            brain.accept_proposal(root, merge["id"])
+
+            facts = brain.read_jsonl(root / "knowledge/canonical/facts.jsonl")
+            events = brain.read_jsonl(root / "knowledge/canonical/events.jsonl")
+            relations = brain.read_jsonl(root / "knowledge/canonical/relations.jsonl")
+            self.assertEqual({fact["entity_id"] for fact in facts}, {"person/yulia-mitrovich"})
+            self.assertEqual({event["entity_id"] for event in events}, {"person/yulia-mitrovich"})
+            self.assertEqual({relation["subject_id"] for relation in relations}, {"person/yulia-mitrovich"})
+            self.assertTrue(brain.run_doctor(root).ok())
+
+    def test_wiki_build_exports_obsidian_friendly_vault_and_source_backlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            export = root / "dist/obsidian"
+            source = root / "knowledge/raw/telegram/yulia.md"
+            write(root / "AGENTS.md", "# test")
+            write(source, "Yulia wants Obsidian-compatible governed memory.")
+            brain.ensure_layout(root)
+            proposal = brain.create_memory_proposal(
+                root,
+                title="Yulia Obsidian memory",
+                source_paths=[source],
+                entity={"type": "person", "name": "Yulia Mitrovich", "aliases": ["@yuliamitrovich83"]},
+                facts=[{"predicate": "wants", "value": "Obsidian-compatible governed memory", "confidence": 0.86}],
+            )
+            brain.accept_proposal(root, proposal["id"])
+            brain.build_wiki(root)
+            brain.export_obsidian_vault(root, export)
+
+            entity_page = export / "entities/person/yulia-mitrovich.md"
+            source_pages = list((export / "sources").glob("*.md"))
+            entity_text = entity_page.read_text(encoding="utf-8")
+            self.assertIn("aliases:", entity_text)
+            self.assertIn("tags:", entity_text)
+            self.assertIn("^fact-", entity_text)
+            self.assertIn("[[Source ", entity_text)
+            self.assertTrue(source_pages)
+            self.assertIn("[[Yulia Mitrovich|Yulia Mitrovich]]", source_pages[0].read_text(encoding="utf-8"))
+            self.assertTrue((export / ".obsidian/app.json").exists())
+
+    def test_reject_records_reason_for_review_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "knowledge/raw/telegram/noise.md"
+            write(root / "AGENTS.md", "# test")
+            write(source, "Unclear duplicated memory claim.")
+            brain.ensure_layout(root)
+            proposal = brain.create_memory_proposal(
+                root,
+                title="Unclear duplicate",
+                source_paths=[source],
+                entity={"type": "person", "name": "Yulia Mitrovich"},
+                facts=[{"predicate": "wants", "value": "unclear duplicate", "confidence": 0.3}],
+            )
+
+            rejected = brain.reject_proposal(root, proposal["id"], reason="Duplicate and weak evidence.")
+
+            self.assertEqual(rejected["status"], "rejected")
+            self.assertEqual(rejected["decision_reason"], "Duplicate and weak evidence.")
 
 
 if __name__ == "__main__":

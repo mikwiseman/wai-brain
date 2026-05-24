@@ -10,3 +10,4 @@ __pycache__/
 .smart-env/
 .playwright-mcp/
 .brain-cache/
+dist/

@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -42,6 +43,7 @@ PROPOSAL_KINDS = {
     "fact_reinforce",
     "fact_supersede",
     "memory_upsert",
+    "relation_add",
 }
 PROPOSAL_STATUSES = {"pending", "accepted", "rejected", "blocked"}
 SECRET_PATTERNS = [
@@ -206,12 +208,22 @@ def add_source(root: Path, source_path: Path) -> dict[str, Any]:
     return record
 
 
-def evidence_for_source(root: Path, source: dict[str, Any]) -> dict[str, Any]:
+def evidence_for_source(root: Path, source: dict[str, Any], quote: str | None = None) -> dict[str, Any]:
     source_path = root / str(source["path"])
     text = source_path.read_text(encoding="utf-8", errors="ignore")
-    span = {"start": 0, "end": len(text)}
-    excerpt = re.sub(r"\s+", " ", text).strip()[:500]
-    quote_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if quote:
+        start = text.find(quote)
+        if start < 0:
+            raise ValueError(f"evidence quote not found in {source['path']}: {quote[:80]}")
+        end = start + len(quote)
+        quoted_text = text[start:end]
+    else:
+        start = 0
+        end = len(text)
+        quoted_text = text
+    span = {"start": start, "end": end}
+    excerpt = re.sub(r"\s+", " ", quoted_text).strip()[:500]
+    quote_hash = hashlib.sha256(quoted_text.encode("utf-8")).hexdigest()
     evidence_id = "ev_" + stable_hash({"source_id": source["id"], "span": span, "quote_hash": quote_hash}, 16)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -310,6 +322,44 @@ def normalize_event(entity_id: str, event: dict[str, Any], source_ids: list[str]
     }
 
 
+def normalize_relation(
+    entity_id: str,
+    relation: dict[str, Any],
+    source_ids: list[str],
+    provenance: list[dict[str, Any]],
+) -> dict[str, Any]:
+    predicate = str(relation.get("predicate") or "").strip()
+    object_id = str(relation.get("object_id") or "").strip()
+    if not predicate or not object_id:
+        raise ValueError("relation.predicate and relation.object_id are required")
+    valid_at = relation.get("valid_at")
+    relation_id = "rel_" + stable_hash(
+        {
+            "subject_id": entity_id,
+            "predicate": predicate,
+            "object_id": object_id,
+            "valid_at": valid_at,
+        }
+    )
+    confidence = float(relation.get("confidence", 0.5))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "id": relation_id,
+        "entity_id": entity_id,
+        "subject_id": entity_id,
+        "predicate": predicate,
+        "object_id": object_id,
+        "confidence": max(0.0, min(1.0, confidence)),
+        "valid_at": valid_at,
+        "invalid_at": relation.get("invalid_at"),
+        "status": str(relation.get("status") or "active"),
+        "rank": str(relation.get("rank") or "normal"),
+        "qualifiers": dict(relation.get("qualifiers") or {}),
+        "provenance": provenance,
+        "source_ids": sorted(set(source_ids)),
+    }
+
+
 def normalize_fact_value(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value).strip().lower().replace("ё", "е"))
 
@@ -360,6 +410,59 @@ def typed_fact_operations(root: Path, fact_record: dict[str, Any]) -> tuple[str,
     return "fact_conflict", "high", operations
 
 
+def _quote_for_source(evidence_quotes: list[str] | None, index: int, source_count: int) -> str | None:
+    if not evidence_quotes:
+        return None
+    if len(evidence_quotes) == source_count:
+        return evidence_quotes[index]
+    if source_count == 1 and len(evidence_quotes) == 1:
+        return evidence_quotes[0]
+    raise ValueError("evidence_quotes must be empty, one quote for one source, or one quote per source")
+
+
+def proposal_dedupe_hints(root: Path, entity_record: dict[str, Any], fact_records: list[dict[str, Any]]) -> dict[str, Any]:
+    existing_entities = [
+        entity
+        for entity in read_jsonl(root / "knowledge/canonical/entities.jsonl")
+        if entity.get("status", "active") == "active"
+    ]
+    name_terms = {
+        normalize_fact_value(entity_record.get("name")),
+        *[normalize_fact_value(alias) for alias in entity_record.get("aliases", [])],
+    }
+    similar_entities = []
+    for entity in existing_entities:
+        candidates = {
+            normalize_fact_value(entity.get("name")),
+            *[normalize_fact_value(alias) for alias in entity.get("aliases", [])],
+        }
+        if name_terms & candidates and entity.get("id") != entity_record.get("id"):
+            similar_entities.append(
+                {
+                    "id": entity.get("id"),
+                    "name": entity.get("name"),
+                    "reason": "matching normalized name or alias",
+                }
+            )
+
+    existing_facts = read_jsonl(root / "knowledge/canonical/facts.jsonl")
+    same_claims = []
+    conflicts = []
+    for fact in fact_records:
+        for existing in existing_facts:
+            if existing.get("entity_id") != fact.get("entity_id") or existing.get("predicate") != fact.get("predicate"):
+                continue
+            if normalize_fact_value(existing.get("value")) == normalize_fact_value(fact.get("value")):
+                same_claims.append({"existing_id": existing.get("id"), "proposed_id": fact.get("id"), "reason": "same predicate/value"})
+            elif existing.get("status") in ACTIVE_FACT_STATUSES:
+                conflicts.append({"existing_id": existing.get("id"), "proposed_id": fact.get("id"), "reason": "same predicate, different value"})
+    return {
+        "similar_entities": similar_entities,
+        "same_claims": same_claims,
+        "conflicts": conflicts,
+    }
+
+
 def create_memory_proposal(
     root: Path,
     *,
@@ -368,15 +471,21 @@ def create_memory_proposal(
     entity: dict[str, Any],
     facts: list[dict[str, Any]] | None = None,
     events: list[dict[str, Any]] | None = None,
+    relations: list[dict[str, Any]] | None = None,
+    evidence_quotes: list[str] | None = None,
 ) -> dict[str, Any]:
     ensure_layout(root)
     sources = [add_source(root, path) for path in source_paths]
     source_ids = sorted({source["id"] for source in sources})
-    evidence = [evidence_for_source(root, source) for source in sources]
+    evidence = [
+        evidence_for_source(root, source, quote=_quote_for_source(evidence_quotes, index, len(sources)))
+        for index, source in enumerate(sources)
+    ]
     provenance = provenance_from_evidence(evidence)
     entity_record = normalize_entity(entity, source_ids)
     fact_records = [normalize_fact(entity_record["id"], fact, source_ids, provenance) for fact in facts or []]
     event_records = [normalize_event(entity_record["id"], event, source_ids, provenance) for event in events or []]
+    relation_records = [normalize_relation(entity_record["id"], relation, source_ids, provenance) for relation in relations or []]
     operations: list[dict[str, Any]] = [{"op": "insert_evidence", "record": item} for item in evidence]
     operations.append({"op": "insert_entity", "record": entity_record})
     proposal_kind = "entity_create"
@@ -392,13 +501,24 @@ def create_memory_proposal(
     for event_record in event_records:
         proposal_kind = "event_add" if proposal_kind == "entity_create" else proposal_kind
         operations.append({"op": "insert_event", "record": event_record})
-    payload = {"entity": entity_record, "facts": fact_records, "events": event_records, "evidence": evidence}
+    for relation_record in relation_records:
+        proposal_kind = "relation_add" if proposal_kind == "entity_create" else "memory_upsert"
+        operations.append({"op": "insert_relation", "record": relation_record})
+    payload = {
+        "entity": entity_record,
+        "facts": fact_records,
+        "events": event_records,
+        "relations": relation_records,
+        "evidence": evidence,
+    }
+    dedupe_hints = proposal_dedupe_hints(root, entity_record, fact_records)
     proposal_id = "prop_" + stable_hash(
         {
             "title": title,
             "entity_id": entity_record["id"],
             "fact_ids": [fact["id"] for fact in fact_records],
             "event_ids": [event["id"] for event in event_records],
+            "relation_ids": [relation["id"] for relation in relation_records],
             "source_ids": source_ids,
         }
     )
@@ -413,8 +533,14 @@ def create_memory_proposal(
         "title": title,
         "status": "pending",
         "risk": risk,
-        "target_ids": [entity_record["id"], *[fact["id"] for fact in fact_records], *[event["id"] for event in event_records]],
+        "target_ids": [
+            entity_record["id"],
+            *[fact["id"] for fact in fact_records],
+            *[event["id"] for event in event_records],
+            *[relation["id"] for relation in relation_records],
+        ],
         "source_ids": source_ids,
+        "dedupe_hints": dedupe_hints,
         "payload": payload,
         "operations": operations,
         "preconditions": [],
@@ -542,6 +668,42 @@ def _merge_entities(root: Path, winner_id: str, loser_id: str, reason: str) -> N
         else:
             updated_records.append(record)
     write_jsonl(path, updated_records)
+    _repoint_entity_references(root, loser_id=loser_id, winner_id=winner_id)
+
+
+def _repoint_entity_references(root: Path, *, loser_id: str, winner_id: str) -> None:
+    for filename in ["facts.jsonl", "events.jsonl"]:
+        path = root / f"knowledge/canonical/{filename}"
+        records = read_jsonl(path)
+        changed = False
+        for record in records:
+            record_changed = False
+            if record.get("entity_id") == loser_id:
+                record["entity_id"] = winner_id
+                record_changed = True
+            if record.get("subject_id") == loser_id:
+                record["subject_id"] = winner_id
+                record_changed = True
+            if record_changed:
+                record["updated_at"] = now_iso()
+                changed = True
+        if changed:
+            write_jsonl(path, records)
+
+    relations_path = root / "knowledge/canonical/relations.jsonl"
+    relations = read_jsonl(relations_path)
+    changed = False
+    for relation in relations:
+        relation_changed = False
+        for field_name in ["entity_id", "subject_id", "object_id"]:
+            if relation.get(field_name) == loser_id:
+                relation[field_name] = winner_id
+                relation_changed = True
+        if relation_changed:
+            relation["updated_at"] = now_iso()
+            changed = True
+    if changed:
+        write_jsonl(relations_path, relations)
 
 
 def apply_operation(root: Path, operation: dict[str, Any]) -> None:
@@ -554,6 +716,8 @@ def apply_operation(root: Path, operation: dict[str, Any]) -> None:
         _upsert_canonical_record(root, "facts.jsonl", operation["record"])
     elif op == "insert_event":
         _upsert_canonical_record(root, "events.jsonl", operation["record"])
+    elif op == "insert_relation":
+        _upsert_canonical_record(root, "relations.jsonl", operation["record"])
     elif op == "set_fact_status":
         updates = {"status": operation["status"]}
         if operation.get("superseded_by"):
@@ -573,7 +737,7 @@ def apply_operation(root: Path, operation: dict[str, Any]) -> None:
         raise ValueError(f"unknown operation: {op}")
 
 
-def _set_proposal_status(root: Path, proposal_id: str, status: str) -> dict[str, Any]:
+def _set_proposal_status(root: Path, proposal_id: str, status: str, reason: str | None = None) -> dict[str, Any]:
     proposals_path = root / "knowledge/review/proposals.jsonl"
     proposals = read_jsonl(proposals_path)
     for index, proposal in enumerate(proposals):
@@ -591,6 +755,8 @@ def _set_proposal_status(root: Path, proposal_id: str, status: str) -> dict[str,
         proposal = dict(proposal)
         proposal["status"] = status
         proposal["decided_at"] = now_iso()
+        if reason:
+            proposal["decision_reason"] = reason
         proposals[index] = proposal
         write_jsonl(proposals_path, proposals)
         return proposal
@@ -623,12 +789,14 @@ def accept_proposal(root: Path, proposal_id: str) -> dict[str, Any]:
             _upsert_canonical_record(root, "facts.jsonl", fact)
         for event in payload.get("events", []):
             _upsert_canonical_record(root, "events.jsonl", event)
+        for relation in payload.get("relations", []):
+            _upsert_canonical_record(root, "relations.jsonl", relation)
     return _set_proposal_status(root, proposal_id, "accepted")
 
 
-def reject_proposal(root: Path, proposal_id: str) -> dict[str, Any]:
+def reject_proposal(root: Path, proposal_id: str, reason: str | None = None) -> dict[str, Any]:
     ensure_layout(root)
-    return _set_proposal_status(root, proposal_id, "rejected")
+    return _set_proposal_status(root, proposal_id, "rejected", reason=reason)
 
 
 def create_entity_merge_proposal(root: Path, *, winner_id: str, loser_id: str, reason: str) -> dict[str, Any]:
@@ -678,26 +846,106 @@ def source_refs(source_ids: Iterable[str], sources: dict[str, dict[str, Any]]) -
     return " ".join(refs)
 
 
+def yaml_scalar(value: Any) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def yaml_list(name: str, values: Iterable[Any]) -> list[str]:
+    cleaned = [str(value) for value in values if str(value)]
+    if not cleaned:
+        return [f"{name}: []"]
+    return [f"{name}:", *[f"  - {yaml_scalar(value)}" for value in cleaned]]
+
+
+def wiki_link(label: str) -> str:
+    safe_label = str(label).replace("[[", "").replace("]]", "").replace("|", "-").strip() or "Untitled"
+    return f"[[{safe_label}|{safe_label}]]"
+
+
+def source_wiki_link(source_id: str) -> str:
+    return f"[[Source {source_id}|Source {source_id}]]"
+
+
+def entity_names_by_id(entities: Iterable[dict[str, Any]]) -> dict[str, str]:
+    return {str(entity.get("id")): str(entity.get("name") or entity.get("id")) for entity in entities}
+
+
+def clean_generated_wiki(root: Path) -> None:
+    for directory in ["knowledge/wiki/entities", "knowledge/wiki/sources"]:
+        path = root / directory
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+
 def build_wiki(root: Path) -> list[Path]:
     ensure_layout(root)
-    entities = [item for item in read_jsonl(root / "knowledge/canonical/entities.jsonl") if item.get("status", "active") == "active"]
+    clean_generated_wiki(root)
+    all_entities = read_jsonl(root / "knowledge/canonical/entities.jsonl")
+    entities = [item for item in all_entities if item.get("status", "active") == "active"]
+    entity_names = entity_names_by_id(all_entities)
     all_facts = read_jsonl(root / "knowledge/canonical/facts.jsonl")
     facts = [item for item in all_facts if item.get("status") == "active"]
     conflicted_facts = [item for item in all_facts if item.get("status") == "contradicted"]
     events = [item for item in read_jsonl(root / "knowledge/canonical/events.jsonl") if item.get("status") == "active"]
+    relations = [item for item in read_jsonl(root / "knowledge/canonical/relations.jsonl") if item.get("status") == "active"]
+    evidence = read_jsonl(root / "knowledge/canonical/evidence.jsonl")
     sources = sources_by_id(root)
     facts_by_entity: dict[str, list[dict[str, Any]]] = {}
     conflicts_by_entity: dict[str, list[dict[str, Any]]] = {}
     events_by_entity: dict[str, list[dict[str, Any]]] = {}
+    outgoing_relations_by_entity: dict[str, list[dict[str, Any]]] = {}
+    incoming_relations_by_entity: dict[str, list[dict[str, Any]]] = {}
+    source_claims: dict[str, list[str]] = {}
     for fact in facts:
         facts_by_entity.setdefault(str(fact.get("entity_id")), []).append(fact)
+        for source_id in fact.get("source_ids", []):
+            source_claims.setdefault(str(source_id), []).append(
+                f"{wiki_link(entity_names.get(str(fact.get('entity_id')), str(fact.get('entity_id'))))}: "
+                f"{fact.get('predicate')} = {fact.get('value')}"
+            )
     for fact in conflicted_facts:
         conflicts_by_entity.setdefault(str(fact.get("entity_id")), []).append(fact)
+        for source_id in fact.get("source_ids", []):
+            source_claims.setdefault(str(source_id), []).append(
+                f"{wiki_link(entity_names.get(str(fact.get('entity_id')), str(fact.get('entity_id'))))}: "
+                f"conflict {fact.get('predicate')} = {fact.get('value')}"
+            )
     for event in events:
         events_by_entity.setdefault(str(event.get("entity_id")), []).append(event)
+        for source_id in event.get("source_ids", []):
+            source_claims.setdefault(str(source_id), []).append(
+                f"{wiki_link(entity_names.get(str(event.get('entity_id')), str(event.get('entity_id'))))}: "
+                f"{event.get('date')} {event.get('summary')}"
+            )
+    for relation in relations:
+        outgoing_relations_by_entity.setdefault(str(relation.get("subject_id")), []).append(relation)
+        incoming_relations_by_entity.setdefault(str(relation.get("object_id")), []).append(relation)
+        for source_id in relation.get("source_ids", []):
+            subject = entity_names.get(str(relation.get("subject_id")), str(relation.get("subject_id")))
+            target = entity_names.get(str(relation.get("object_id")), str(relation.get("object_id")))
+            source_claims.setdefault(str(source_id), []).append(
+                f"{wiki_link(subject)}: {relation.get('predicate')} -> {wiki_link(target)}"
+            )
 
     written: list[Path] = []
-    index_lines = ["# WaiBrain Wiki Index", "", "Generated from canonical memory records.", ""]
+    index_lines = [
+        "---",
+        "id: wiki-index",
+        "title: \"WaiBrain Wiki Index\"",
+        "tags:",
+        "  - wai-brain/index",
+        "generated_from: canonical",
+        f"generated_at: {yaml_scalar(now_iso())}",
+        "---",
+        "",
+        "# WaiBrain Wiki Index",
+        "",
+        "Generated from canonical memory records.",
+        "",
+        "## Entities",
+        "",
+    ]
     for entity in sorted(entities, key=lambda item: (str(item.get("type")), str(item.get("name")))):
         entity_id = str(entity["id"])
         entity_type, slug = entity_id.split("/", 1)
@@ -705,14 +953,21 @@ def build_wiki(root: Path) -> list[Path]:
         entity_facts = sorted(facts_by_entity.get(entity_id, []), key=lambda item: str(item.get("predicate")))
         entity_conflicts = sorted(conflicts_by_entity.get(entity_id, []), key=lambda item: (str(item.get("predicate")), str(item.get("value"))))
         entity_events = sorted(events_by_entity.get(entity_id, []), key=lambda item: str(item.get("date")), reverse=True)
+        outgoing_relations = sorted(outgoing_relations_by_entity.get(entity_id, []), key=lambda item: (str(item.get("predicate")), str(item.get("object_id"))))
+        incoming_relations = sorted(incoming_relations_by_entity.get(entity_id, []), key=lambda item: (str(item.get("predicate")), str(item.get("subject_id"))))
         summary = entity_facts[0]["value"] if entity_facts else "Conflicting facts need review." if entity_conflicts else "No accepted facts yet."
         lines = [
             "---",
-            "type: entity",
-            f"entity_id: {entity_id}",
-            f"title: {json.dumps(entity['name'], ensure_ascii=False)}",
+            f"id: {yaml_scalar(entity_id)}",
+            f"type: {yaml_scalar('entity')}",
+            f"entity_type: {yaml_scalar(entity_type)}",
+            f"title: {yaml_scalar(entity['name'])}",
+            *yaml_list("aliases", entity.get("aliases", [])),
+            *yaml_list("tags", ["entity", f"entity/{entity_type}"]),
+            "status: accepted",
             "generated_from: canonical",
-            f"generated_at: {now_iso()}",
+            f"generated_at: {yaml_scalar(now_iso())}",
+            *yaml_list("source_ids", entity.get("source_ids", [])),
             "---",
             "",
             f"# {entity['name']}",
@@ -727,9 +982,11 @@ def build_wiki(root: Path) -> list[Path]:
         if entity_facts:
             for fact in entity_facts:
                 confidence = float(fact.get("confidence", 0.0))
+                fact_anchor = "fact-" + slugify(str(fact["id"]))
+                source_links = " ".join(source_wiki_link(str(source_id)) for source_id in fact.get("source_ids", []))
                 lines.append(
                     f"- **{fact['predicate']}:** {fact['value']} "
-                    f"(confidence: {confidence:.2f}) {source_refs(fact.get('source_ids', []), sources)}"
+                    f"(confidence: {confidence:.2f}) {source_links} ^{fact_anchor}"
                 )
         else:
             lines.append("- No accepted facts.")
@@ -741,22 +998,142 @@ def build_wiki(root: Path) -> list[Path]:
             for predicate, slot_facts in sorted(conflicts_by_slot.items()):
                 lines.append(f"### {predicate}")
                 for fact in slot_facts:
-                    lines.append(f"- {fact['value']} {source_refs(fact.get('source_ids', []), sources)}")
+                    source_links = " ".join(source_wiki_link(str(source_id)) for source_id in fact.get("source_ids", []))
+                    lines.append(f"- {fact['value']} {source_links}")
+        lines.extend(["", "## Relations", ""])
+        if outgoing_relations or incoming_relations:
+            for relation in outgoing_relations:
+                target_id = str(relation.get("object_id"))
+                target_name = entity_names.get(target_id, target_id)
+                source_links = " ".join(source_wiki_link(str(source_id)) for source_id in relation.get("source_ids", []))
+                relation_anchor = "rel-" + slugify(str(relation["id"]))
+                lines.append(
+                    f"- **{relation['predicate']}:** {wiki_link(target_name)} "
+                    f"(confidence: {float(relation.get('confidence', 0.0)):.2f}) {source_links} ^{relation_anchor}"
+                )
+            for relation in incoming_relations:
+                subject_id = str(relation.get("subject_id"))
+                subject_name = entity_names.get(subject_id, subject_id)
+                source_links = " ".join(source_wiki_link(str(source_id)) for source_id in relation.get("source_ids", []))
+                relation_anchor = "rel-" + slugify(str(relation["id"]))
+                lines.append(
+                    f"- {wiki_link(subject_name)} **{relation['predicate']}** this entity "
+                    f"(confidence: {float(relation.get('confidence', 0.0)):.2f}) {source_links} ^{relation_anchor}"
+                )
+        else:
+            lines.append("- No accepted relations.")
         lines.extend(["", "## Timeline", ""])
         if entity_events:
             for event in entity_events:
-                lines.append(f"- **{event['date']}** | {event['summary']} {source_refs(event.get('source_ids', []), sources)}")
+                event_anchor = "event-" + slugify(str(event["id"]))
+                source_links = " ".join(source_wiki_link(str(source_id)) for source_id in event.get("source_ids", []))
+                lines.append(f"- **{event['date']}** | {event['summary']} {source_links} ^{event_anchor}")
         else:
             lines.append("- No accepted events.")
+        lines.extend(["", "## Provenance", ""])
+        entity_source_ids = sorted(
+            {
+                *entity.get("source_ids", []),
+                *[source_id for fact in entity_facts for source_id in fact.get("source_ids", [])],
+                *[source_id for fact in entity_conflicts for source_id in fact.get("source_ids", [])],
+                *[source_id for event in entity_events for source_id in event.get("source_ids", [])],
+                *[source_id for relation in [*outgoing_relations, *incoming_relations] for source_id in relation.get("source_ids", [])],
+            }
+        )
+        if entity_source_ids:
+            for source_id in entity_source_ids:
+                source = sources.get(str(source_id), {})
+                lines.append(f"- {source_wiki_link(str(source_id))} [Source: {source.get('path', source_id)}]")
+        else:
+            lines.append("- No source references.")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
         written.append(path)
         index_lines.append(f"- [{entity['name']}](entities/{entity_type}/{slug}.md) - `{entity_id}`")
+    if sources:
+        index_lines.extend(["", "## Sources", ""])
+    for source_id, source in sorted(sources.items()):
+        source_path = root / "knowledge/wiki/sources" / f"{source_id}.md"
+        source_evidence = [item for item in evidence if item.get("source_id") == source_id]
+        lines = [
+            "---",
+            f"id: {yaml_scalar(source_id)}",
+            f"type: {yaml_scalar('source')}",
+            f"title: {yaml_scalar('Source ' + source_id)}",
+            *yaml_list("tags", ["source", f"source/{source.get('kind', 'raw')}"]),
+            "status: accepted",
+            "generated_from: canonical",
+            f"generated_at: {yaml_scalar(now_iso())}",
+            f"source_path: {yaml_scalar(source.get('path', ''))}",
+            f"sha256: {yaml_scalar(source.get('sha256', ''))}",
+            "---",
+            "",
+            f"# Source {source_id}",
+            "",
+            f"- **Path:** `{source.get('path', '')}`",
+            f"- **SHA-256:** `{source.get('sha256', '')}`",
+            "",
+            "## Evidence Spans",
+            "",
+        ]
+        if source_evidence:
+            for item in source_evidence:
+                span = item.get("span", {})
+                lines.append(f"- `{item.get('id')}` chars {span.get('start')}:{span.get('end')} `{item.get('quote_hash')}`")
+                if item.get("excerpt"):
+                    lines.append(f"  - {item.get('excerpt')}")
+        else:
+            lines.append("- No accepted evidence spans yet.")
+        lines.extend(["", "## Referenced Claims", ""])
+        for claim in source_claims.get(source_id, []):
+            lines.append(f"- {claim}")
+        if not source_claims.get(source_id):
+            lines.append("- No accepted claims reference this source yet.")
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        written.append(source_path)
+        index_lines.append(f"- [Source {source_id}](sources/{source_id}.md) - `{source.get('path', '')}`")
     index_path = root / "knowledge/wiki/INDEX.md"
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text("\n".join(index_lines).rstrip() + "\n", encoding="utf-8")
     written.append(index_path)
     return written
+
+
+def export_obsidian_vault(root: Path, target: Path) -> Path:
+    ensure_layout(root)
+    build_wiki(root)
+    source = root / "knowledge/wiki"
+    target = target.resolve()
+    source_resolved = source.resolve()
+    if target == root.resolve() or target == source_resolved or source_resolved in target.parents:
+        raise ValueError(f"unsafe Obsidian export target: {target}")
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(source, target)
+    obsidian_dir = target / ".obsidian"
+    obsidian_dir.mkdir(parents=True, exist_ok=True)
+    (obsidian_dir / "app.json").write_text(
+        json.dumps(
+            {
+                "attachmentFolderPath": "attachments",
+                "alwaysUpdateLinks": True,
+                "newFileLocation": "folder",
+                "showUnsupportedFiles": False,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (target / "README.md").write_text(
+        "# WaiBrain Obsidian Vault\n\n"
+        "Generated from canonical WaiBrain memory. Treat this vault as read-only; "
+        "make durable changes through review proposals and rebuild the export.\n",
+        encoding="utf-8",
+    )
+    return target
 
 
 def build_site(root: Path) -> Path:
@@ -765,10 +1142,15 @@ def build_site(root: Path) -> Path:
     pending = [item for item in proposals if item.get("status") == "pending"]
     entities = read_jsonl(root / "knowledge/canonical/entities.jsonl")
     facts = [item for item in read_jsonl(root / "knowledge/canonical/facts.jsonl") if item.get("status") == "active"]
+    relations = [item for item in read_jsonl(root / "knowledge/canonical/relations.jsonl") if item.get("status") == "active"]
     sources = sources_by_id(root)
+    entity_names = entity_names_by_id(entities)
     facts_by_entity: dict[str, list[dict[str, Any]]] = {}
     for fact in facts:
         facts_by_entity.setdefault(str(fact.get("entity_id")), []).append(fact)
+    relations_by_entity: dict[str, list[dict[str, Any]]] = {}
+    for relation in relations:
+        relations_by_entity.setdefault(str(relation.get("subject_id")), []).append(relation)
 
     def esc(value: Any) -> str:
         return html.escape(str(value), quote=True)
@@ -778,9 +1160,18 @@ def build_site(root: Path) -> Path:
         payload = proposal.get("payload", {})
         entity = payload.get("entity", {})
         fact_items = "".join(f"<li>{esc(f.get('predicate'))}: {esc(f.get('value'))}</li>" for f in payload.get("facts", []))
+        relation_items = "".join(
+            f"<li>{esc(r.get('predicate'))}: {esc(r.get('object_id'))}</li>" for r in payload.get("relations", [])
+        )
         evidence_items = "".join(
             f"<li><code>{esc(item.get('source_path'))}</code><br>{esc(item.get('excerpt'))}</li>"
             for item in payload.get("evidence", [])
+        )
+        hints = proposal.get("dedupe_hints") or {}
+        hint_items = "".join(
+            f"<li>{esc(item.get('reason'))}: <code>{esc(item.get('id') or item.get('existing_id'))}</code></li>"
+            for bucket in ["similar_entities", "same_claims", "conflicts"]
+            for item in hints.get(bucket, [])
         )
         operation_items = "".join(
             f"<li><code>{esc(op.get('op'))}</code> {esc(op.get('id') or op.get('winner_id') or op.get('record', {}).get('id') or '')}</li>"
@@ -791,6 +1182,8 @@ def build_site(root: Path) -> Path:
             f"<div class=\"eyebrow\">{esc(proposal.get('kind'))} / {esc(proposal.get('risk', 'low'))}</div><h3>{esc(proposal.get('title'))}</h3>"
             f"<p><strong>{esc(entity.get('name', 'unknown'))}</strong> <code>{esc(entity.get('id', ''))}</code></p>"
             f"<ul>{fact_items or '<li>No facts in proposal.</li>'}</ul>"
+            f"{'<h4>Relations</h4><ul>' + relation_items + '</ul>' if relation_items else ''}"
+            f"{'<h4>Dedupe / conflict hints</h4><ul>' + hint_items + '</ul>' if hint_items else ''}"
             f"<h4>Evidence</h4><ul>{evidence_items or '<li>No evidence spans.</li>'}</ul>"
             f"<h4>Semantic diff</h4><ul>{operation_items or '<li>No operations.</li>'}</ul>"
             f"<p class=\"muted\">{esc(source_refs(proposal.get('source_ids', []), sources))}</p>"
@@ -805,14 +1198,20 @@ def build_site(root: Path) -> Path:
             conflicts_by_entity.setdefault(str(fact.get("entity_id")), []).append(fact)
     for entity in entities:
         entity_facts = facts_by_entity.get(str(entity.get("id")), [])
+        entity_relations = relations_by_entity.get(str(entity.get("id")), [])
         entity_conflicts = conflicts_by_entity.get(str(entity.get("id")), [])
         fact_items = "".join(f"<li><strong>{esc(f.get('predicate'))}</strong>: {esc(f.get('value'))}</li>" for f in entity_facts)
+        relation_items = "".join(
+            f"<li><strong>{esc(r.get('predicate'))}</strong>: {esc(entity_names.get(str(r.get('object_id')), r.get('object_id')))}</li>"
+            for r in entity_relations
+        )
         conflict_items = "".join(f"<li><strong>{esc(f.get('predicate'))}</strong>: {esc(f.get('value'))}</li>" for f in entity_conflicts)
         canonical_cards.append(
             "<article class=\"card\">"
             f"<div class=\"eyebrow\">{esc(entity.get('type'))}</div><h3>{esc(entity.get('name'))}</h3>"
             f"<p><code>{esc(entity.get('id'))}</code></p>"
             f"<ul>{fact_items or '<li>No accepted facts yet.</li>'}</ul>"
+            f"{'<h4>Relations</h4><ul>' + relation_items + '</ul>' if relation_items else ''}"
             f"{'<h4>Open conflicts</h4><ul>' + conflict_items + '</ul>' if conflict_items else ''}"
             "</article>"
         )
@@ -873,17 +1272,22 @@ def workspace_payload(root: Path) -> dict[str, Any]:
     facts = read_jsonl(root / "knowledge/canonical/facts.jsonl")
     entities = read_jsonl(root / "knowledge/canonical/entities.jsonl")
     evidence = read_jsonl(root / "knowledge/canonical/evidence.jsonl")
+    relations = read_jsonl(root / "knowledge/canonical/relations.jsonl")
+    sources = read_jsonl(root / "knowledge/manifests/sources.jsonl")
     return {
         "generated_at": now_iso(),
         "pending_count": sum(1 for item in proposals if item.get("status") == "pending"),
         "proposal_count": len(proposals),
         "entity_count": len(entities),
         "fact_count": len(facts),
+        "relation_count": len(relations),
         "conflict_count": sum(1 for item in facts if item.get("status") == "contradicted"),
         "proposals": proposals,
         "entities": entities,
         "facts": facts,
+        "relations": relations,
         "evidence": evidence,
+        "sources": sources,
     }
 
 
@@ -969,7 +1373,8 @@ function renderCounts() {
     `<span class="chip">${workspace.pending_count} pending</span>`,
     `<span class="chip">${workspace.conflict_count} conflicts</span>`,
     `<span class="chip">${workspace.entity_count} entities</span>`,
-    `<span class="chip">${workspace.fact_count} facts</span>`
+    `<span class="chip">${workspace.fact_count} facts</span>`,
+    `<span class="chip">${workspace.relation_count} relations</span>`
   ].join("");
 }
 
@@ -1000,6 +1405,9 @@ function renderDecision() {
   }
   const entity = p.payload?.entity || {};
   const facts = p.payload?.facts || [];
+  const relations = p.payload?.relations || [];
+  const hints = p.dedupe_hints || {};
+  const hintRows = ["similar_entities", "same_claims", "conflicts"].flatMap((key) => (hints[key] || []).map((item) => ({ key, item })));
   decision.className = "card";
   decision.innerHTML = `
     <div class="eyebrow ${p.risk === "high" ? "risk-high" : p.risk === "medium" ? "risk-medium" : ""}">${esc(p.kind)} / ${esc(p.risk || "low")}</div>
@@ -1007,6 +1415,8 @@ function renderDecision() {
     <p><strong>${esc(entity.name || "Unknown")}</strong> <code>${esc(entity.id || "")}</code></p>
     <h3>Proposed change</h3>
     <ul class="list">${facts.length ? facts.map((f) => `<li><strong>${esc(f.predicate)}</strong>: ${esc(f.value)}</li>`).join("") : "<li>No facts in proposal.</li>"}</ul>
+    ${relations.length ? `<h3>Relations</h3><ul class="list">${relations.map((r) => `<li><strong>${esc(r.predicate)}</strong>: <code>${esc(r.object_id)}</code></li>`).join("")}</ul>` : ""}
+    ${hintRows.length ? `<h3>Dedupe / conflict hints</h3><ul class="list">${hintRows.map(({ key, item }) => `<li>${esc(key)}: <code>${esc(item.id || item.existing_id || "")}</code> ${esc(item.reason || "")}</li>`).join("")}</ul>` : ""}
     <div class="actions">
       <button class="primary" onclick="review('accept')">Accept</button>
       <button class="danger" onclick="review('reject')">Reject</button>
@@ -1043,7 +1453,13 @@ function render() {
 async function review(action) {
   const p = currentProposal();
   if (!p) return;
-  const res = await fetch(`/api/review?action=${action}&id=${encodeURIComponent(p.id)}`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  const payload = {};
+  if (action === "reject") {
+    const reason = window.prompt("Reject reason", "");
+    if (reason === null) return;
+    if (reason.trim()) payload.reason = reason.trim();
+  }
+  const res = await fetch(`/api/review?action=${action}&id=${encodeURIComponent(p.id)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
   const body = await res.json();
   document.getElementById("status").textContent = res.ok ? `${action}: ${body.id || p.id}` : `error: ${body.error}`;
   await loadWorkspace();
@@ -1119,13 +1535,21 @@ def start_review_server(root: Path, port: int = 8765, *, open_browser: bool = Fa
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query)
             if parsed.path == "/api/review":
+                body: dict[str, Any] = {}
+                length = int(self.headers.get("content-length") or "0")
+                if length:
+                    try:
+                        body = json.loads(self.rfile.read(length).decode("utf-8"))
+                    except json.JSONDecodeError:
+                        json_response(self, 400, {"error": "invalid JSON request body"})
+                        return
                 proposal_id = (query.get("id") or [""])[0]
                 action = (query.get("action") or [""])[0]
                 if not proposal_id or action not in {"accept", "reject"}:
                     json_response(self, 400, {"error": "missing proposal id or invalid action"})
                     return
                 try:
-                    result = accept_proposal(root, proposal_id) if action == "accept" else reject_proposal(root, proposal_id)
+                    result = accept_proposal(root, proposal_id) if action == "accept" else reject_proposal(root, proposal_id, reason=body.get("reason"))
                     build_wiki(root)
                     build_site(root)
                     json_response(self, 200, result)
@@ -1276,6 +1700,10 @@ def run_doctor(root: Path) -> CheckResult:
             entity_id = record.get("entity_id") or record.get("subject_id")
             if entity_id and entity_id not in entities:
                 result.add_error(f"{filename}:{record.get('id')}: unknown entity id {entity_id}")
+            if filename == "relations.jsonl":
+                object_id = record.get("object_id")
+                if object_id and object_id not in entities:
+                    result.add_error(f"{filename}:{record.get('id')}: unknown object entity id {object_id}")
 
     for fact in read_jsonl(root / "knowledge/canonical/facts.jsonl"):
         require_fields(result, "facts", fact, ["id", "entity_id", "predicate", "value", "status", "source_ids"])
@@ -1292,6 +1720,17 @@ def run_doctor(root: Path) -> CheckResult:
         require_fields(result, "events", event, ["id", "entity_id", "date", "summary", "status", "source_ids"])
         if event.get("status") == "active" and not event.get("provenance"):
             result.add_error(f"events:{event.get('id')}: active event missing provenance")
+
+    for relation in read_jsonl(root / "knowledge/canonical/relations.jsonl"):
+        require_fields(result, "relations", relation, ["id", "subject_id", "predicate", "object_id", "status", "source_ids"])
+        if relation.get("status") not in FACT_STATUSES:
+            result.add_error(f"relations:{relation.get('id')}: invalid status {relation.get('status')}")
+        if relation.get("status") == "active" and not relation.get("provenance"):
+            result.add_error(f"relations:{relation.get('id')}: active relation missing provenance")
+        for prov in relation.get("provenance", []):
+            evidence_id = prov.get("evidence_id") if isinstance(prov, dict) else None
+            if evidence_id not in evidence:
+                result.add_error(f"relations:{relation.get('id')}: unknown evidence id {evidence_id}")
 
     for proposal in read_jsonl(root / "knowledge/review/proposals.jsonl"):
         require_fields(result, "proposals", proposal, ["id", "kind", "status", "operations"])
@@ -1321,6 +1760,16 @@ def _parse_fact_args(values: list[str]) -> list[dict[str, Any]]:
     return facts
 
 
+def _parse_relation_args(values: list[str]) -> list[dict[str, Any]]:
+    relations = []
+    for value in values:
+        if "=" not in value:
+            raise SystemExit(f"--relation must be predicate=entity_id: {value}")
+        predicate, object_id = value.split("=", 1)
+        relations.append({"predicate": predicate.strip(), "object_id": object_id.strip(), "confidence": 0.75})
+    return relations
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="WaiBrain canonical memory, review, wiki, and site tooling")
     parser.add_argument("--root", default=".", help="wai-brain root")
@@ -1330,6 +1779,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("init")
     site = sub.add_parser("site")
     site.add_argument("action", choices=["build"])
+    obsidian = sub.add_parser("obsidian")
+    obsidian_sub = obsidian.add_subparsers(dest="obsidian_command", required=True)
+    obsidian_export = obsidian_sub.add_parser("export")
+    obsidian_export.add_argument("--path", required=True, help="target Obsidian vault directory")
     serve = sub.add_parser("serve")
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--open", action="store_true")
@@ -1346,6 +1799,8 @@ def main(argv: list[str] | None = None) -> int:
     propose.add_argument("--entity-type", default="person")
     propose.add_argument("--alias", action="append", default=[])
     propose.add_argument("--fact", action="append", default=[], help="predicate=value")
+    propose.add_argument("--relation", action="append", default=[], help="predicate=entity_id")
+    propose.add_argument("--evidence-quote", action="append", default=[], help="claim-level quote to pin as evidence span")
     propose.add_argument("--event-date")
     propose.add_argument("--event-summary")
 
@@ -1363,6 +1818,7 @@ def main(argv: list[str] | None = None) -> int:
     accept.add_argument("id")
     reject = review_sub.add_parser("reject")
     reject.add_argument("id")
+    reject.add_argument("--reason")
 
     args = parser.parse_args(argv)
     root = Path(args.root).resolve()
@@ -1387,6 +1843,11 @@ def main(argv: list[str] | None = None) -> int:
         path = build_site(root)
         print(path)
         return 0
+    if args.command == "obsidian":
+        if args.obsidian_command == "export":
+            path = export_obsidian_vault(root, Path(args.path) if Path(args.path).is_absolute() else root / args.path)
+            print(path)
+            return 0
     if args.command == "serve":
         server = start_review_server(root, port=args.port, open_browser=args.open)
         print(f"serving WaiBrain review at http://127.0.0.1:{server.port}/")
@@ -1411,7 +1872,9 @@ def main(argv: list[str] | None = None) -> int:
             source_paths=[Path(item) if Path(item).is_absolute() else root / item for item in args.source],
             entity={"type": args.entity_type, "name": args.entity_name, "aliases": args.alias},
             facts=_parse_fact_args(args.fact),
+            relations=_parse_relation_args(args.relation),
             events=events,
+            evidence_quotes=args.evidence_quote,
         )
         print(json.dumps(proposal, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
@@ -1444,7 +1907,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         if args.review_command == "reject":
             try:
-                print(json.dumps(reject_proposal(root, args.id), ensure_ascii=False, indent=2, sort_keys=True))
+                print(json.dumps(reject_proposal(root, args.id, reason=args.reason), ensure_ascii=False, indent=2, sort_keys=True))
                 return 0
             except KeyError as exc:
                 print(f"error: {exc}", file=sys.stderr)
