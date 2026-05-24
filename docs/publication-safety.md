@@ -1,41 +1,27 @@
----
-type: topic
-title: "Publication safety"
-created: 2026-05-04
-updated: 2026-05-04
-tags: [publishing, safety]
----
-
 # Publication Safety
 
-This repository is safe to publish only when the working tree and Git history contain no private material.
+This repository is the public-safe WaiBrain engine/template. It must not
+contain private memory, raw Telegram exports, customer data, health data,
+financial data, real private identifiers, OAuth usernames, server IPs, token
+locations, or secret names.
 
-## Rule
+Deleted files remain in Git history. If a repository has ever contained private
+data, do not simply make it public. Create a fresh clean repository or rewrite
+history and verify it separately.
 
-If a repository has ever contained private data, do not simply toggle it public. Deleted files remain in Git history.
-
-Safe publication paths:
-
-1. Create a fresh public repository from a clean tree.
-2. Or rewrite history, verify the rewritten history, and force-push only after a separate review.
-
-## Public-Safe Checklist
-
-- No real raw captures.
-- No private project/person/family/company pages.
-- No real chat IDs.
-- No server IPs or private hostnames.
-- No deploy-key paths.
-- No OAuth usernames.
-- No token locations or secret names.
-- No manifests pointing at private files.
-
-Run:
+Before publishing or pushing public-facing changes, run:
 
 ```bash
 python3 -m unittest discover -s tests
 python3 scripts/brain.py doctor
-python3 scripts/brain.py index --check
-python3 scripts/brain.py eval
+python3 scripts/brain.py wiki build
+python3 scripts/brain.py site build
 git diff --check
 ```
+
+The canonical public-safe boundary is:
+
+- `knowledge/raw/` contains only synthetic examples in this public repo.
+- `knowledge/canonical/*.jsonl` must not contain private records here.
+- `knowledge/review/proposals.jsonl` must not contain private source excerpts.
+- Generated `knowledge/wiki/` and `knowledge/site/` are public-safe projections.

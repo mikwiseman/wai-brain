@@ -1,1 +1,1 @@
-"""wai-brain local tooling package."""
+"""WaiBrain local tooling package."""

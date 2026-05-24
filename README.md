@@ -1,54 +1,61 @@
 # wai-brain
 
-Public-safe template for a local-first second brain and agent-memory system.
+Local-first WaiBrain prototype: reviewable AI memory with canonical JSONL,
+generated Markdown wiki, and a minimal static HTML review surface.
 
-The repository keeps Markdown as the canonical store, uses immutable raw evidence, lets agents compile durable knowledge into wiki/project/person pages, and verifies the whole system with deterministic local tooling.
+## Philosophy
 
-## What This Repo Contains
+WaiBrain separates memory into layers:
 
-- `scripts/brain.py` — stdlib-only CLI for `doctor`, `search`, `index`, `eval`, and source manifests.
-- `.claude/skills/` — reusable agent workflows for inbox processing, source ingest, linting, eval, weekly review, and people updates.
-- `knowledge/` — synthetic example vault structure.
-- `knowledge/manifests/` — JSONL provenance ledgers.
-- `infra/openclaw/wai-brain-capture.md` — generic capture recipe with placeholders.
-- `docs/publication-safety.md` — rules for keeping a public repo separate from a private vault.
+- `knowledge/raw/` keeps immutable source evidence.
+- `knowledge/review/proposals.jsonl` stores candidate memory changes.
+- `knowledge/canonical/*.jsonl` is the source of truth after review.
+- `knowledge/wiki/` is generated Markdown for humans and agents.
+- `knowledge/site/index.html` is a minimal local review/workbench page.
 
-## What This Repo Must Not Contain
+RAG is a query layer over canonical records, generated wiki, and raw evidence.
+It is not allowed to write truth directly.
 
-- Real chat exports or raw private messages.
-- Real people, family, health, financial, customer, investor, or company memory.
-- Chat IDs, server IPs, deploy-key paths, OAuth usernames, token locations, or secret names.
-- Private project pages or decisions.
-- Manifests pointing at private source files.
+## Quick Start
 
-Keep private memory in a separate private vault. Use this repository as the public engine/template.
+```bash
+python3 scripts/brain.py init
+python3 scripts/brain.py propose \
+  --title "Yulia memory governance problem" \
+  --source knowledge/raw/telegram/yulia.md \
+  --entity-name "Yulia Mitrovich" \
+  --entity-type person \
+  --alias "@yuliamitrovich83" \
+  --fact "has_problem=needs governable AI memory without duplicate generated content"
+python3 scripts/brain.py review list
+python3 scripts/brain.py review accept <proposal_id>
+python3 scripts/brain.py wiki build
+python3 scripts/brain.py site build
+python3 scripts/brain.py serve --port 8765
+```
 
-## Layout
+Typed proposal kinds include `fact_add`, `fact_reinforce`, `fact_supersede`,
+`fact_conflict`, `event_add`, `entity_create`, and `entity_merge`.
 
-- `knowledge/raw/example/` — synthetic immutable raw examples.
-- `knowledge/wiki/` — compiled topical pages and generated `INDEX.md`.
-- `knowledge/people/` — person pages using compiled-truth + timeline rules.
-- `knowledge/projects/` — project pages using compiled-truth + timeline rules.
-- `knowledge/eval/` — golden retrieval questions and generated eval reports.
-- `knowledge/manifests/` — append-only source/claim JSONL ledgers.
+To stage an entity merge:
 
-## Local Checks
+```bash
+python3 scripts/brain.py merge-entity \
+  --winner person/yulia-mitrovich \
+  --loser person/yuliamitrovich83 \
+  --reason "Telegram handle belongs to the same person"
+```
+
+Open `http://127.0.0.1:8765/` after `serve` for the live review workbench.
+It supports pending proposal inspection plus browser accept/reject actions.
+`knowledge/site/index.html` remains a static snapshot export.
+
+## Checks
 
 ```bash
 python3 -m unittest discover -s tests
 python3 scripts/brain.py doctor
-python3 scripts/brain.py index --check
-python3 scripts/brain.py eval
+python3 scripts/brain.py wiki build
+python3 scripts/brain.py site build
+python3 scripts/brain.py serve --port 8765
 ```
-
-`doctor` includes public-safety checks for common private-data patterns.
-
-## Publishing Warning
-
-Deleting private files in a commit does not remove them from Git history. If a repository has ever contained private data, do not make that existing repository public. Create a fresh public repo from a clean tree or rewrite history and verify it before publication.
-
-## References
-
-- Karpathy LLM Wiki — https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
-- GBrain — https://github.com/garrytan/gbrain
-- AGENTS.md standard — https://agents.md
