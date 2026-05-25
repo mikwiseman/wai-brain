@@ -490,6 +490,66 @@ class WaiBrainReviewPipelineTests(unittest.TestCase):
             self.assertEqual(rejected["status"], "rejected")
             self.assertEqual(rejected["decision_reason"], "Duplicate and weak evidence.")
 
+    def test_connector_state_upsert_is_idempotent_without_canonical_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root / "AGENTS.md", "# test")
+            brain.ensure_layout(root)
+
+            first = brain.upsert_connector_state(
+                root,
+                provider="telegram",
+                account="yulia",
+                scope="chat:yuliamitrovich83",
+                cursor="message:100",
+                privacy_class="private",
+                sync_window={"mode": "incremental"},
+                status="active",
+            )
+            second = brain.upsert_connector_state(
+                root,
+                provider="telegram",
+                account="yulia",
+                scope="chat:yuliamitrovich83",
+                cursor="message:101",
+                privacy_class="private",
+                sync_window={"mode": "incremental"},
+                status="active",
+            )
+
+            connectors = brain.read_jsonl(root / "knowledge/manifests/connectors.jsonl")
+            self.assertEqual(first["id"], second["id"])
+            self.assertEqual(len(connectors), 1)
+            self.assertEqual(connectors[0]["cursor"], "message:101")
+            self.assertEqual(connectors[0]["sync_window"], {"mode": "incremental"})
+            self.assertEqual(brain.read_jsonl(root / "knowledge/canonical/facts.jsonl"), [])
+            self.assertTrue(brain.run_doctor(root).ok())
+
+    def test_doctor_catches_invalid_connector_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root / "AGENTS.md", "# test")
+            brain.ensure_layout(root)
+            brain.write_jsonl(
+                root / "knowledge/manifests/connectors.jsonl",
+                [
+                    {
+                        "schema_version": brain.SCHEMA_VERSION,
+                        "id": "conn_bad",
+                        "provider": "telegram",
+                        "account": "yulia",
+                        "scope": "chat:yuliamitrovich83",
+                        "status": "guessing",
+                        "privacy_class": "private",
+                    }
+                ],
+            )
+
+            result = brain.run_doctor(root)
+
+            self.assertFalse(result.ok())
+            self.assertTrue(any("invalid status" in error for error in result.errors))
+
 
 if __name__ == "__main__":
     unittest.main()

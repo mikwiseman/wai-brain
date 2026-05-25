@@ -46,6 +46,8 @@ PROPOSAL_KINDS = {
     "relation_add",
 }
 PROPOSAL_STATUSES = {"pending", "accepted", "rejected", "blocked"}
+CONNECTOR_STATUSES = {"active", "paused", "error", "stale", "disabled"}
+PRIVACY_CLASSES = {"private", "internal", "public-safe", "public", "secret", "unknown"}
 SECRET_PATTERNS = [
     ("OpenAI-style secret", re.compile(r"sk-[A-Za-z0-9_-]{20,}")),
     ("GitHub token", re.compile(r"(?:github_pat_|ghp_)[A-Za-z0-9_]{20,}")),
@@ -60,6 +62,7 @@ LAYOUT_FILES = [
     "knowledge/canonical/facts.jsonl",
     "knowledge/canonical/events.jsonl",
     "knowledge/canonical/relations.jsonl",
+    "knowledge/manifests/connectors.jsonl",
     "knowledge/manifests/sources.jsonl",
     "knowledge/review/proposals.jsonl",
 ]
@@ -206,6 +209,88 @@ def add_source(root: Path, source_path: Path) -> dict[str, Any]:
     record["status"] = status
     upsert_by_id(sources_path, record)
     return record
+
+
+def connector_state_id(provider: str, account: str, scope: str) -> str:
+    return "conn_" + stable_hash({"provider": provider, "account": account, "scope": scope}, 12)
+
+
+def upsert_connector_state(
+    root: Path,
+    *,
+    provider: str,
+    account: str,
+    scope: str,
+    cursor: str | None = None,
+    status: str = "active",
+    privacy_class: str = "private",
+    sync_window: dict[str, Any] | None = None,
+    permissions_hash: str | None = None,
+    page_budget: int | None = None,
+    last_error: str | None = None,
+) -> dict[str, Any]:
+    ensure_layout(root)
+    provider = provider.strip()
+    account = account.strip()
+    scope = scope.strip()
+    status = status.strip()
+    privacy_class = privacy_class.strip()
+    if not provider or not account or not scope:
+        raise ValueError("provider, account, and scope are required")
+    if status not in CONNECTOR_STATUSES:
+        raise ValueError(f"invalid connector status: {status}")
+    if privacy_class not in PRIVACY_CLASSES:
+        raise ValueError(f"invalid privacy class: {privacy_class}")
+
+    state_id = connector_state_id(provider, account, scope)
+    path = root / "knowledge/manifests/connectors.jsonl"
+    existing = {item["id"]: item for item in read_jsonl(path)}
+    now = now_iso()
+    record = dict(existing.get(state_id) or {})
+    record.update(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "id": state_id,
+            "provider": provider,
+            "account": account,
+            "scope": scope,
+            "status": status,
+            "privacy_class": privacy_class,
+            "last_attempt_at": now,
+            "updated_at": now,
+        }
+    )
+    if "created_at" not in record:
+        record["created_at"] = now
+    if sync_window is not None:
+        record["sync_window"] = dict(sync_window)
+    elif "sync_window" not in record:
+        record["sync_window"] = {}
+    if cursor is not None:
+        record["cursor"] = cursor
+    elif "cursor" not in record:
+        record["cursor"] = None
+    if permissions_hash is not None:
+        record["permissions_hash"] = permissions_hash
+    elif "permissions_hash" not in record:
+        record["permissions_hash"] = None
+    if page_budget is not None:
+        record["page_budget"] = int(page_budget)
+    elif "page_budget" not in record:
+        record["page_budget"] = None
+    if status == "active":
+        record["last_success_at"] = now
+        record["last_error"] = None
+    elif last_error is not None:
+        record["last_error"] = last_error
+    elif "last_error" not in record:
+        record["last_error"] = None
+    upsert_by_id(path, record)
+    return record
+
+
+def connector_states(root: Path) -> list[dict[str, Any]]:
+    return read_jsonl(root / "knowledge/manifests/connectors.jsonl")
 
 
 def evidence_for_source(root: Path, source: dict[str, Any], quote: str | None = None) -> dict[str, Any]:
@@ -1274,10 +1359,12 @@ def workspace_payload(root: Path) -> dict[str, Any]:
     evidence = read_jsonl(root / "knowledge/canonical/evidence.jsonl")
     relations = read_jsonl(root / "knowledge/canonical/relations.jsonl")
     sources = read_jsonl(root / "knowledge/manifests/sources.jsonl")
+    connectors = connector_states(root)
     return {
         "generated_at": now_iso(),
         "pending_count": sum(1 for item in proposals if item.get("status") == "pending"),
         "proposal_count": len(proposals),
+        "connector_count": len(connectors),
         "entity_count": len(entities),
         "fact_count": len(facts),
         "relation_count": len(relations),
@@ -1288,6 +1375,7 @@ def workspace_payload(root: Path) -> dict[str, Any]:
         "relations": relations,
         "evidence": evidence,
         "sources": sources,
+        "connectors": connectors,
     }
 
 
@@ -1661,7 +1749,9 @@ def run_doctor(root: Path) -> CheckResult:
     sources = sources_by_id(root)
     evidence = {item["id"]: item for item in read_jsonl(root / "knowledge/canonical/evidence.jsonl")}
     entities = {item["id"]: item for item in read_jsonl(root / "knowledge/canonical/entities.jsonl")}
+    connectors = {item["id"]: item for item in connector_states(root)}
     for label, records in [
+        ("connectors", list(connectors.values())),
         ("sources", list(sources.values())),
         ("evidence", list(evidence.values())),
         ("entities", list(entities.values())),
@@ -1679,6 +1769,15 @@ def run_doctor(root: Path) -> CheckResult:
             result.add_error(f"sources:{source.get('id')}: source path missing {source.get('path')}")
         elif file_hash(source_path) != source.get("sha256"):
             result.add_error(f"sources:{source.get('id')}: source hash drift for {source.get('path')}")
+
+    for connector in connectors.values():
+        require_fields(result, "connectors", connector, ["id", "provider", "account", "scope", "status", "privacy_class"])
+        if connector.get("status") not in CONNECTOR_STATUSES:
+            result.add_error(f"connectors:{connector.get('id')}: invalid status {connector.get('status')}")
+        if connector.get("privacy_class") not in PRIVACY_CLASSES:
+            result.add_error(f"connectors:{connector.get('id')}: invalid privacy class {connector.get('privacy_class')}")
+        if connector.get("status") == "error" and not connector.get("last_error"):
+            result.add_warning(f"connectors:{connector.get('id')}: error status without last_error")
 
     for evidence_record in evidence.values():
         require_fields(result, "evidence", evidence_record, ["id", "source_id", "source_path", "source_sha256", "span", "quote_hash"])
@@ -1770,6 +1869,16 @@ def _parse_relation_args(values: list[str]) -> list[dict[str, Any]]:
     return relations
 
 
+def _parse_json_object(value: str, label: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{label} must be a JSON object: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit(f"{label} must be a JSON object")
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="WaiBrain canonical memory, review, wiki, and site tooling")
     parser.add_argument("--root", default=".", help="wai-brain root")
@@ -1791,6 +1900,21 @@ def main(argv: list[str] | None = None) -> int:
     search = sub.add_parser("search")
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=10)
+
+    connector = sub.add_parser("connector")
+    connector_sub = connector.add_subparsers(dest="connector_command", required=True)
+    connector_sub.add_parser("list")
+    connector_upsert = connector_sub.add_parser("upsert")
+    connector_upsert.add_argument("--provider", required=True)
+    connector_upsert.add_argument("--account", required=True)
+    connector_upsert.add_argument("--scope", required=True)
+    connector_upsert.add_argument("--cursor")
+    connector_upsert.add_argument("--status", default="active", choices=sorted(CONNECTOR_STATUSES))
+    connector_upsert.add_argument("--privacy-class", default="private", choices=sorted(PRIVACY_CLASSES))
+    connector_upsert.add_argument("--sync-window", default="{}", help="JSON object describing the bounded sync window")
+    connector_upsert.add_argument("--permissions-hash")
+    connector_upsert.add_argument("--page-budget", type=int)
+    connector_upsert.add_argument("--last-error")
 
     propose = sub.add_parser("propose")
     propose.add_argument("--title", required=True)
@@ -1862,6 +1986,34 @@ def main(argv: list[str] | None = None) -> int:
         for score, path, snippet in search_docs(root, args.query, args.limit):
             print(f"{score:.2f}\t{path.as_posix()}\t{snippet}")
         return 0
+    if args.command == "connector":
+        if args.connector_command == "list":
+            for state in connector_states(root):
+                print(
+                    f"{state['id']}\t{state.get('provider')}\t{state.get('account')}\t"
+                    f"{state.get('scope')}\t{state.get('status')}\t{state.get('cursor')}"
+                )
+            return 0
+        if args.connector_command == "upsert":
+            try:
+                state = upsert_connector_state(
+                    root,
+                    provider=args.provider,
+                    account=args.account,
+                    scope=args.scope,
+                    cursor=args.cursor,
+                    status=args.status,
+                    privacy_class=args.privacy_class,
+                    sync_window=_parse_json_object(args.sync_window, "--sync-window"),
+                    permissions_hash=args.permissions_hash,
+                    page_budget=args.page_budget,
+                    last_error=args.last_error,
+                )
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            print(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
     if args.command == "propose":
         events = []
         if args.event_summary:

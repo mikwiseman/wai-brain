@@ -11,6 +11,7 @@ Canonical memory lives in structured ledgers:
 - `knowledge/canonical/events.jsonl`
 - `knowledge/canonical/relations.jsonl`
 - `knowledge/canonical/evidence.jsonl`
+- `knowledge/manifests/connectors.jsonl`
 - `knowledge/manifests/sources.jsonl`
 
 Markdown and HTML are projections. They can be deleted and rebuilt from
@@ -72,10 +73,16 @@ facts directly. A connector can track provider ids, cursors, privacy class,
 attachments, and sync state, then hand evidence to an extractor that creates
 review proposals.
 
+Connector state lives in `knowledge/manifests/connectors.jsonl`. Each record is
+scoped to one provider/account/source scope and tracks cursor, status, privacy
+class, sync window, page budget, permission hash, and last error. Updating this
+ledger is safe because it does not mutate accepted memory.
+
 ## v0 Boundaries
 
 Implemented now:
 
+- connector/account/scope sync-state ledger
 - source hashing
 - atomic JSONL writes
 - pending typed review proposals
@@ -101,4 +108,4 @@ Not implemented yet:
 - full temporal validity windows beyond supersede/conflict status
 - vector embeddings/reranking
 - Telegram/Gmail/voice connectors
-- connector sync state and attachment manifests
+- attachment manifests

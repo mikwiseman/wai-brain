@@ -8,6 +8,7 @@ generated Markdown wiki, and a minimal static HTML review surface.
 WaiBrain separates memory into layers:
 
 - `knowledge/raw/` keeps immutable source evidence.
+- `knowledge/manifests/connectors.jsonl` stores connector/account sync state.
 - `knowledge/review/proposals.jsonl` stores candidate memory changes.
 - `knowledge/canonical/*.jsonl` is the source of truth after review.
 - `knowledge/wiki/` is generated Markdown for humans and agents.
@@ -20,6 +21,13 @@ It is not allowed to write truth directly.
 
 ```bash
 python3 scripts/brain.py init
+python3 scripts/brain.py connector upsert \
+  --provider telegram \
+  --account yulia \
+  --scope chat:yuliamitrovich83 \
+  --cursor message:100 \
+  --privacy-class private \
+  --sync-window '{"mode":"incremental"}'
 python3 scripts/brain.py propose \
   --title "Yulia memory governance problem" \
   --source knowledge/raw/telegram/yulia.md \
@@ -35,6 +43,10 @@ python3 scripts/brain.py site build
 python3 scripts/brain.py obsidian export --path dist/obsidian
 python3 scripts/brain.py serve --port 8765
 ```
+
+Connector state is the safe boundary for MCP/API sync. It records provider,
+account, scope, cursor, privacy class, sync window, status, and errors. It does
+not write canonical memory.
 
 Typed proposal kinds include `fact_add`, `fact_reinforce`, `fact_supersede`,
 `fact_conflict`, `event_add`, `relation_add`, `entity_create`, and
@@ -77,6 +89,7 @@ The market/architecture research behind this direction is in
 ```bash
 python3 -m unittest discover -s tests
 python3 scripts/brain.py doctor
+python3 scripts/brain.py connector list
 python3 scripts/brain.py wiki build
 python3 scripts/brain.py site build
 python3 scripts/brain.py obsidian export --path dist/obsidian
